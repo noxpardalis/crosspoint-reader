@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,14 @@ class HttpDownloader {
   // downloadToFile() and fail into their error UI instead.
   static constexpr uint32_t MIN_TLS_FREE_HEAP = 40000;
   static constexpr uint32_t MIN_TLS_MAX_ALLOC = 20000;
+
+  // Plain HTTP does not allocate a TLS record buffer. A redirect to another
+  // origin is checked conservatively because the destination may use TLS.
+  static constexpr bool hasDownloadHeapHeadroom(const std::string_view url, const uint32_t freeHeap,
+                                                const uint32_t largestBlock, const bool sameOrigin = true) {
+    return (sameOrigin && url.starts_with("http://")) ||
+           (freeHeap >= MIN_TLS_FREE_HEAP && largestBlock >= MIN_TLS_MAX_ALLOC);
+  }
 
   using Header = std::pair<std::string, std::string>;
 

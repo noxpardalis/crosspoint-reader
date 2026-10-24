@@ -51,11 +51,19 @@ HttpDownloader::DownloadError runGetSecure(const std::string& url, const std::st
   freeink::FetchOptions options;
   options.redirectToHttp = downgradeRedirectsToHttp;
   bool answeredBySameOrigin = true;
+  bool blockedByHeap = false;
   const freeink::FetchResult result = freeink::fetchResumable(
       url, options,
       [&](freeink::SecureHttpClient& http, const bool sameOrigin) {
         answeredBySameOrigin = sameOrigin;
         applyCommonClientSetup(http);
+        if (bytesOut &&
+            !HttpDownloader::hasDownloadHeapHeadroom(url, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), sameOrigin)) {
+          LOG_ERR("HTTP", "Low heap for TLS or cross-origin download (%u free, %u max block)", ESP.getFreeHeap(),
+                  ESP.getMaxAllocHeap());
+          blockedByHeap = true;
+          return;
+        }
         // Credentials and caller headers stay with the starting origin; a
         // redirect elsewhere (or to plain http) gets neither.
         if (sameOrigin) {
@@ -65,12 +73,13 @@ HttpDownloader::DownloadError runGetSecure(const std::string& url, const std::st
         LOG_DBG("HTTP", "wolfSSL GET: %s (heap %u, max block %u)", url.c_str(), (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMaxAllocHeap());
       },
-      sink, [cancelFlag] { return cancelFlag && *cancelFlag; });
+      sink, [cancelFlag, &blockedByHeap] { return blockedByHeap || (cancelFlag && *cancelFlag); });
   if (bytesOut) *bytesOut = result.bytes;
   // FetchResult::status is -1 when no response arrived (bad URL, DNS, connect, TLS).
   g_lastStatus = result.status < 0 ? 0 : result.status;
   g_lastRedirected = !answeredBySameOrigin;
 
+  if (blockedByHeap) return HttpDownloader::HTTP_ERROR;
   if (result.aborted) return HttpDownloader::ABORTED;
   if (result.stopped) return HttpDownloader::FILE_ERROR;
   if (result.status == 401 || result.status == 403) {
