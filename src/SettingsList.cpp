@@ -193,6 +193,10 @@ void forEachBaseSetting(SettingVisitor visit, void* context) {
 
   // Persisted here; set from the Connectivity -> Plugins popup.
   emit(SettingInfo::Toggle(StrId::STR_PLUGINS, &CrossPointSettings::pluginsEnabled, "pluginsEnabled").withWebHidden());
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  emit(SettingInfo::Toggle(StrId::STR_WIREGUARD, &CrossPointSettings::wireGuardEnabled, "wireGuardEnabled",
+                           StrId::STR_SETTINGS_NETWORK));
+#endif
   emit(SettingInfo::Toggle(StrId::STR_PLUGIN_HUB, &CrossPointSettings::pluginHubPromptHidden, "pluginHubPromptHidden")
            .withWebHidden());
 

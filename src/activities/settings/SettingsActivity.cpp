@@ -76,6 +76,7 @@ SettingsSection sectionFor(const SettingInfo& setting) {
   if (setting.category == StrId::STR_CAT_DISPLAY) return SettingsSection::Display;
   if (setting.category == StrId::STR_CAT_READER) return SettingsSection::Reader;
   if (setting.category == StrId::STR_CAT_CONTROLS) return SettingsSection::Controls;
+  if (setting.category == StrId::STR_SETTINGS_NETWORK) return SettingsSection::Network;
   if (setting.category == StrId::STR_CAT_SYSTEM) return SettingsSection::General;
   return SettingsSection::End;
 }

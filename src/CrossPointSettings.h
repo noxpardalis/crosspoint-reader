@@ -370,6 +370,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // this disabled; settings migration enables it when pre-existing plugin files
   // are found so a firmware update never silently disables an existing setup.
   uint8_t pluginsEnabled = 0;
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  uint8_t wireGuardEnabled = 0;
+#endif
   // User hid the Plugin Hub install row; cleared when plugins are turned back on.
   uint8_t pluginHubPromptHidden = 0;
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
