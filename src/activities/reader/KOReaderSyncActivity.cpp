@@ -6,11 +6,15 @@
 #include <Logging.h>
 #include <TrustedTime.h>
 #include <WiFi.h>
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+#include <WireGuardManager.h>
+#endif
 #include <esp_wifi.h>
 
 #include <algorithm>
 #include <cassert>
 
+#include "CrossPointSettings.h"
 #include "Epub/Section.h"
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
@@ -118,6 +122,36 @@ void KOReaderSyncActivity::completeAlreadySynced() {
   requestUpdate(true);
 }
 
+bool KOReaderSyncActivity::prepareTunnel() {
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  if (SETTINGS.wireGuardEnabled == 0) return true;
+  {
+    RenderLock lock(*this);
+    state = SYNCING;
+    statusMessage = tr(STR_CONNECTING);
+  }
+  requestUpdateAndWait();
+  if (!WIREGUARD_TUNNEL.prepare(true)) {
+    {
+      RenderLock lock(*this);
+      state = SYNC_FAILED;
+      statusMessage = tr(STR_WIREGUARD_FAILED);
+    }
+    WiFi.setSleep(true);
+    requestUpdate(true);
+    return false;
+  }
+#endif
+  return true;
+}
+
+void KOReaderSyncActivity::finishNetworkTransaction() {
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  WIREGUARD_TUNNEL.shutdown();
+#endif
+  WiFi.setSleep(true);
+}
+
 void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   if (!success) {
     LOG_DBG("KOSync", "WiFi connection failed, exiting");
@@ -146,6 +180,8 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
     return;
   }
 
+  if (!prepareTunnel()) return;
+
   {
     RenderLock lock(*this);
     state = SYNCING;
@@ -162,6 +198,7 @@ void KOReaderSyncActivity::performSync() {
   const DocumentMatchMethod primaryMethod = KOREADER_STORE.getMatchMethod();
   documentHash = calculateDocumentHashForMethod(epubPath, primaryMethod);
   if (documentHash.empty()) {
+    finishNetworkTransaction();
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -189,6 +226,7 @@ void KOReaderSyncActivity::performSync() {
       clippingsSynced = clippingSync::run(epubPath, documentHash);
     }
     if (!clippingsSynced) {
+      finishNetworkTransaction();
       {
         RenderLock lock(*this);
         state = SYNC_FAILED;
@@ -246,6 +284,7 @@ void KOReaderSyncActivity::performSync() {
     }
 
     // No remote progress - offer to upload
+    finishNetworkTransaction();
     {
       RenderLock lock(*this);
       state = NO_REMOTE_PROGRESS;
@@ -256,6 +295,7 @@ void KOReaderSyncActivity::performSync() {
   }
 
   if (result != KOReaderSyncClient::OK) {
+    finishNetworkTransaction();
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -269,6 +309,7 @@ void KOReaderSyncActivity::performSync() {
   hasRemoteProgress = true;
   ensureEpubLoaded();
   if (!epub) {
+    finishNetworkTransaction();
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -321,12 +362,14 @@ void KOReaderSyncActivity::performSync() {
             remoteProgress.progress.c_str(), remotePosition.spineIndex, remotePosition.pageNumber);
     switch (comparison) {
       case ProgressComparison::Synchronized:
+        finishNetworkTransaction();
         completeAlreadySynced();
         return;
       case ProgressComparison::LocalAhead:
         performUpload();
         return;
       case ProgressComparison::RemoteAhead:
+        finishNetworkTransaction();
         saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
         return;
       case ProgressComparison::Unknown:
@@ -336,6 +379,7 @@ void KOReaderSyncActivity::performSync() {
   }
 
   // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
+  finishNetworkTransaction();
   {
     RenderLock lock(*this);
     state = SHOWING_RESULT;
@@ -346,6 +390,9 @@ void KOReaderSyncActivity::performSync() {
 }
 
 void KOReaderSyncActivity::performUpload() {
+  WiFi.setSleep(false);
+  if (!prepareTunnel()) return;
+
   {
     RenderLock lock(*this);
     state = UPLOADING;
@@ -424,6 +471,9 @@ void KOReaderSyncActivity::performUpload() {
   }
 
   // Drop the radio while user reads the result; full teardown happens at silent reboot.
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  WIREGUARD_TUNNEL.shutdown();
+#endif
   esp_wifi_stop();
 
   if (result != KOReaderSyncClient::OK) {
@@ -476,6 +526,9 @@ void KOReaderSyncActivity::onEnter() {
 }
 
 void KOReaderSyncActivity::onExit() {
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  WIREGUARD_TUNNEL.shutdown();
+#endif
   Activity::onExit();
 
   if (wifiActivated) {

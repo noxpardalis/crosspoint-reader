@@ -4,7 +4,11 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+#include <WireGuardManager.h>
+#endif
 
+#include "CrossPointSettings.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncClient.h"
 #include "MappedInputManager.h"
@@ -30,7 +34,24 @@ void KOReaderAuthActivity::onWifiSelectionComplete(const bool success) {
     state = AUTHENTICATING;
     statusMessage = mode == Mode::SIGN_UP ? tr(STR_CREATING_ACCOUNT) : tr(STR_AUTHENTICATING);
   }
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  if (SETTINGS.wireGuardEnabled != 0) {
+    requestUpdateAndWait();
+    if (!WIREGUARD_TUNNEL.prepare(true)) {
+      {
+        RenderLock lock(*this);
+        state = FAILED;
+        errorMessage = tr(STR_WIREGUARD_FAILED);
+      }
+      requestUpdate();
+      return;
+    }
+  } else {
+    requestUpdate();
+  }
+#else
   requestUpdate();
+#endif
 
   performAuthentication();
 }
@@ -68,6 +89,9 @@ void KOReaderAuthActivity::onEnter() {
 }
 
 void KOReaderAuthActivity::onExit() {
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  WIREGUARD_TUNNEL.shutdown();
+#endif
   Activity::onExit();
 
   if (WiFi.getMode() != WIFI_MODE_NULL) {

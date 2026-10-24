@@ -81,6 +81,8 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
   bool pluginEventsOnly = false;
 
   void onWifiSelectionComplete(bool success);
+  bool prepareTunnel();
+  void finishNetworkTransaction();
   void performSync();
   void performUpload();
   bool smartSyncEnabled() const;
