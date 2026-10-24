@@ -1,0 +1,328 @@
+diff --git a/src/WireGuard-ESP32.h b/src/WireGuard-ESP32.h
+index a9f854f..fa64f82 100644
+--- a/src/WireGuard-ESP32.h
++++ b/src/WireGuard-ESP32.h
+@@ -20,6 +20,7 @@ public:
+                   uint16_t jc, uint16_t jmin, uint16_t jmax,
+                   uint16_t s1, uint16_t s2, uint16_t s3, uint16_t s4,
+                   const char* headerProtectionKey);
++    bool waitForHandshake(uint32_t timeoutMs);
+     void end();
+     bool is_initialized() const { return this->_is_initialized; }
+ };
+diff --git a/src/WireGuard.cpp b/src/WireGuard.cpp
+index b856e9e..07c1fe1 100644
+--- a/src/WireGuard.cpp
++++ b/src/WireGuard.cpp
+@@ -18,6 +18,7 @@
+ #include "esp32-hal-log.h"
+ 
+ extern "C" {
++#include "crypto.h"
+ #include "wireguard.h"
+ #include "wireguardif.h"
+ #include "wireguard-platform.h"
+@@ -27,7 +28,9 @@ extern "C" {
+ static struct netif wg_netif_struct = {0};
+ static struct netif *wg_netif = NULL;
+ static struct netif *previous_default_netif = NULL;
++static bool s_default_netif_replaced = false;
+ static uint8_t s_wireguard_peer_index = WIREGUARDIF_INVALID_INDEX;
++static uint8_t s_preshared_key[WIREGUARD_SESSION_KEY_LEN];
+ 
+ #define TAG "[WireGuard] "
+ 
+@@ -56,0 +60,4 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
++	// netif_add invokes wireguardif_init synchronously, and device setup needs
++	// the platform random context before the interface can be constructed.
++	wireguard_platform_init();
++
+@@ -59,7 +66,9 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
+ 
+ 	// Setup the WireGuard device structure
+ 	wg.private_key = privateKey;
+-    wg.listen_port = remotePeerPort;
++	// A client does not need to bind the server's port. Port zero lets lwIP
++	// choose an ephemeral source port and avoids collisions with local users.
++	wg.listen_port = 0;
+ 
+ 	wg.bind_netif = NULL;
+ 
+@@ -87,15 +96,20 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
+         struct addrinfo *res = NULL;
+         struct addrinfo hint;
+         memset(&hint, 0, sizeof(hint));
++		hint.ai_family = AF_INET;
+         memset(&endpoint_ip, 0, sizeof(endpoint_ip));
+         if( lwip_getaddrinfo(remotePeerAddress, NULL, &hint, &res) != 0 ) {
+ 			vTaskDelay(pdMS_TO_TICKS(2000));
+ 			continue;
+ 		}
+-		success_get_endpoint_ip = true;
+         struct in_addr addr4 = ((struct sockaddr_in *) (res->ai_addr))->sin_addr;
+         inet_addr_to_ip4addr(ip_2_ip4(&endpoint_ip), &addr4);
+         lwip_freeaddrinfo(res);
++		if (ip_addr_isany(&endpoint_ip)) {
++			log_e(TAG "endpoint resolved to an unspecified address.");
++			return false;
++		}
++		success_get_endpoint_ip = true;
+ 
+         peer.endpoint_ip = endpoint_ip;
+         log_i(TAG "%s is %3d.%3d.%3d.%3d"
+@@ -124,21 +134,27 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
+ 	netif_set_up(wg_netif);
+ 
+ 	peer.public_key = remotePeerPublicKey;
+-	// Preshared key: raw 32 bytes, decoded from base64 (static so it outlives this call)
+-	static uint8_t awg_psk[WIREGUARD_SESSION_KEY_LEN];
++	// Preshared key: raw 32 bytes, kept only until add_peer copies it.
++	crypto_zero(s_preshared_key, sizeof(s_preshared_key));
+ 	if (presharedKey != nullptr) {
+-		size_t psk_len = sizeof(awg_psk);
+-		if (wireguard_base64_decode(presharedKey, awg_psk, &psk_len) && (psk_len == sizeof(awg_psk))) {
+-			peer.preshared_key = awg_psk;
++		size_t psk_len = sizeof(s_preshared_key);
++		if (wireguard_base64_decode(presharedKey, s_preshared_key, &psk_len) &&
++				(psk_len == sizeof(s_preshared_key))) {
++			peer.preshared_key = s_preshared_key;
+ 		} else {
+ 			log_e(TAG "failed to decode preshared key.");
+-			peer.preshared_key = NULL;
++			crypto_zero(s_preshared_key, sizeof(s_preshared_key));
++			wireguardif_shutdown(wg_netif);
++			netif_remove(wg_netif);
++			wg_netif = nullptr;
++			UNLOCK_TCPIP_CORE();
++			return false;
+ 		}
+ 	} else {
+ 		peer.preshared_key = NULL;
+ 	}
+-	// Keepalive: 0 = library default (10 s), otherwise seconds as configured
+-	peer.keep_alive = (keepAlive > 0) ? keepAlive : WIREGUARDIF_KEEPALIVE_DEFAULT;
++	// Match wg-quick semantics: zero disables persistent keepalive.
++	peer.keep_alive = keepAlive;
+ 	// Allow all IPs through tunnel
+     {
+         ip_addr_t allowed_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
+@@ -152,15 +174,32 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
+-    // Initialize the platform
+-    wireguard_platform_init();
+ 	// Register the new WireGuard peer with the netwok interface
+-	wireguardif_add_peer(wg_netif, &peer, &s_wireguard_peer_index);
++	if (wireguardif_add_peer(wg_netif, &peer, &s_wireguard_peer_index) != ERR_OK) {
++		crypto_zero(s_preshared_key, sizeof(s_preshared_key));
++		wireguardif_shutdown(wg_netif);
++		netif_remove(wg_netif);
++		wg_netif = nullptr;
++		UNLOCK_TCPIP_CORE();
++		log_e(TAG "failed to add peer.");
++		return false;
++	}
++	crypto_zero(s_preshared_key, sizeof(s_preshared_key));
+-	if ((s_wireguard_peer_index != WIREGUARDIF_INVALID_INDEX) && !ip_addr_isany(&peer.endpoint_ip)) {
++	if (s_wireguard_peer_index != WIREGUARDIF_INVALID_INDEX) {
+ 		// Start outbound connection to peer
+         log_i(TAG "connecting wireguard...");
+-		wireguardif_connect(wg_netif, s_wireguard_peer_index);
++		if (wireguardif_connect(wg_netif, s_wireguard_peer_index) != ERR_OK) {
++			wireguardif_remove_peer(wg_netif, s_wireguard_peer_index);
++			s_wireguard_peer_index = WIREGUARDIF_INVALID_INDEX;
++			wireguardif_shutdown(wg_netif);
++			netif_remove(wg_netif);
++			wg_netif = nullptr;
++			UNLOCK_TCPIP_CORE();
++			log_e(TAG "failed to connect peer.");
++			return false;
++		}
+ 	// Save the current default interface for restoring when shutting down the WG interface.
+ 	previous_default_netif = netif_default;
+ 	// Set default interface to WG device.
+     netif_set_default(wg_netif);
++	s_default_netif_replaced = true;
+ 	}
+ 
+ 	UNLOCK_TCPIP_CORE();
+@@ -169,6 +204,22 @@ bool WireGuard::beginAWG(const IPAddress& localIP, const char* privateKey, const
+ 	return true;
+ }
+ 
++bool WireGuard::waitForHandshake(uint32_t timeoutMs) {
++	if (!this->_is_initialized || wg_netif == nullptr || s_wireguard_peer_index == WIREGUARDIF_INVALID_INDEX) {
++		return false;
++	}
++	const TickType_t started = xTaskGetTickCount();
++	const TickType_t timeout = pdMS_TO_TICKS(timeoutMs);
++	while (xTaskGetTickCount() - started < timeout) {
++		LOCK_TCPIP_CORE();
++		const bool ready = wireguardif_peer_is_up(wg_netif, s_wireguard_peer_index, nullptr, nullptr) == ERR_OK;
++		UNLOCK_TCPIP_CORE();
++		if (ready) return true;
++		vTaskDelay(pdMS_TO_TICKS(100));
++	}
++	return false;
++}
++
+ bool WireGuard::begin(const IPAddress& localIP, const char* privateKey, const char* remotePeerAddress, const char* remotePeerPublicKey, uint16_t remotePeerPort) {
+ 	// Maintain compatiblity with old begin 
+ 	auto subnet = IPAddress(255,255,255,255);
+@@ -179,9 +230,13 @@ bool WireGuard::begin(const IPAddress& localIP, const char* privateKey, const ch
+ void WireGuard::end() {
+ 	if( !this->_is_initialized ) return;
+ 
++	LOCK_TCPIP_CORE();
+-	// Restore the default interface.
+-	netif_set_default(previous_default_netif);
+-	previous_default_netif = nullptr;
++	// Restore the default interface only if beginAWG replaced it.
++	if (s_default_netif_replaced) {
++		netif_set_default(previous_default_netif);
++		previous_default_netif = nullptr;
++		s_default_netif_replaced = false;
++	}
+ 	// Disconnect the WG interface.
+ 	wireguardif_disconnect(wg_netif, s_wireguard_peer_index);
+ 	// Remove peer from the WG interface
+@@ -190,8 +241,10 @@ void WireGuard::end() {
+-	// Shutdown the wireguard interface.
+-	wireguardif_shutdown(wg_netif);
+-	// Remove the WG interface;
+-	netif_remove(wg_netif);
+-	wg_netif = nullptr;
+-
+-	this->_is_initialized = false;
+-}
+\ No newline at end of file
++	// Keep interface state alive while lwIP closes TCP connections routed through it.
++	netif_remove(wg_netif);
++	// Shutdown the wireguard interface.
++	wireguardif_shutdown(wg_netif);
++	wg_netif = nullptr;
++	UNLOCK_TCPIP_CORE();
++
++	this->_is_initialized = false;
++	crypto_zero(s_preshared_key, sizeof(s_preshared_key));
++}
+diff --git a/src/wireguardif.c b/src/wireguardif.c
+index 77ebbbf..c5b2885 100644
+--- a/src/wireguardif.c
++++ b/src/wireguardif.c
+@@ -970,7 +970,8 @@ void wireguardif_shutdown(struct netif *netif) {
+ 		udp_remove(device->udp_pcb);
+ 		device->udp_pcb = NULL;
+ 	}
+-	// remove device context.
++	// Remove device context after erasing long-lived private/session keys.
++	crypto_zero(device, sizeof(struct wireguard_device));
+ 	free(device);
+ 	netif->state = NULL;
+ }
+@@ -1126,6 +1127,7 @@ err_t wireguardif_init(struct netif *netif) {
+ 		log_e(TAG "netif or state is NULL: netif=%p, netif.state:%p", netif, netif ? netif->state : NULL);
+ 		result = ERR_ARG;
+ 	}
++	crypto_zero(private_key, sizeof(private_key));
+ 	return result;
+ }
+ 
+diff --git a/src/wireguard-platform.c b/src/wireguard-platform.c
+index f0014aa..cc2439b 100644
+--- a/src/wireguard-platform.c
++++ b/src/wireguard-platform.c
+@@ -39,8 +39,10 @@ static int entropy_hw_random_source( void *data, unsigned char *output, size_t l
+-#define TAI_EPOCH_1970_MS 0x400000000000000aULL * 1000ULL
++#define TAI64_SECONDS_BASE 0x400000000000000aULL
+ // Системное время "реалистично", если позже 2024-01-01 (unix ms)
+ #define UNIX_MS_REALISTIC_MIN 1704067200000ULL
++#define TAI_RESERVATION_MS (60ULL * 60ULL * 1000ULL)
+ static const char *TAI_TAG = "[WG-time]";
+-static uint64_t s_lastTaiMs = 0;   // максимальный выданный таймштамп, мс TAI
++static uint64_t s_lastUnixMs = 0;
++static uint64_t s_reservedUnixMs = 0;
+ static bool s_taiRestored = false;
+ 
+ static void tai_restore_from_nvs(void) {
+@@ -50,9 +52,10 @@ static void tai_restore_from_nvs(void) {
+ 	if (nvs_open("wgtime", NVS_READONLY, &h) == ESP_OK) {
+ 		uint64_t stored = 0;
+-		if (nvs_get_u64(h, "taims", &stored) == ESP_OK) {
++		if (nvs_get_u64(h, "unixms", &stored) == ESP_OK) {
+ 			// Отбрасываем мусорные значения (из эпохи 1970 - до первого NTP)
+-			if (stored > TAI_EPOCH_1970_MS + UNIX_MS_REALISTIC_MIN) {
+-				s_lastTaiMs = stored;
++			if (stored > UNIX_MS_REALISTIC_MIN) {
++				s_lastUnixMs = stored;
++				s_reservedUnixMs = stored;
+ 				ESP_LOGI(TAI_TAG, "из NVS восстановлен максимум таймштампа");
+ 			} else {
+ 				ESP_LOGW(TAI_TAG, "в NVS нереалистичный таймштамп - игнорирую");
+@@ -62,16 +65,21 @@ static void tai_restore_from_nvs(void) {
+ 	s_taiRestored = true;
+ }
+ 
+-static void tai_persist_if_greater(uint64_t taiMs) {
+-	static uint64_t persisted = 0;
+-	if (taiMs <= persisted) return;
++// Persist an upper bound before issuing timestamps from that range. Rekeys then
++// consume RAM-only values while a reboot resumes beyond every previously issued value.
++static void tai_reserve_if_needed(uint64_t unixMs) {
++	if (unixMs <= s_reservedUnixMs) return;
++	const uint64_t reserved = unixMs + TAI_RESERVATION_MS;
+ 	nvs_handle_t h;
+ 	if (nvs_open("wgtime", NVS_READWRITE, &h) == ESP_OK) {
+-		if (nvs_set_u64(h, "taims", taiMs) == ESP_OK) {
+-			nvs_commit(h);
+-			persisted = taiMs;
++		if (nvs_set_u64(h, "unixms", reserved) == ESP_OK && nvs_commit(h) == ESP_OK) {
++			s_reservedUnixMs = reserved;
++		} else {
++			ESP_LOGE(TAI_TAG, "failed to persist timestamp reservation");
+ 		}
+ 		nvs_close(h);
++	} else {
++		ESP_LOGE(TAI_TAG, "failed to open timestamp reservation in NVS");
+ 	}
+ }
+ 
+@@ -103,14 +111,13 @@ void wireguard_tai64n_now(uint8_t *output) {
+ 	struct timeval tv;
+ 	gettimeofday(&tv, NULL);
+ 	uint64_t unixMs = (tv.tv_sec * 1000LL + (tv.tv_usec / 1000LL));
+-	uint64_t taiMs = TAI_EPOCH_1970_MS + unixMs;
+ 
+ 	tai_restore_from_nvs();
+ 
+ 	if (unixMs >= UNIX_MS_REALISTIC_MIN) {
+ 		// Системное время синхронизировано - берём его (или максимум с NVS)
+-		if (taiMs <= s_lastTaiMs) {
+-			taiMs = s_lastTaiMs + 1;
++		if (unixMs <= s_lastUnixMs) {
++			unixMs = s_lastUnixMs + 1;
+ 		}
+ 	} else {
+ 		// Время не синхронизировано (1970+uptime): выдаём максимум+1.
+@@ -118,17 +125,15 @@ void wireguard_tai64n_now(uint8_t *output) {
+ 		// но vpnInit не поднимает туннель до успешного NTP, так что это
+ 		// защитный путь.
+ 		ESP_LOGW(TAI_TAG, "системное время не синхронизировано - выдаю максимум из NVS");
+-		taiMs = s_lastTaiMs + 1;
++		unixMs = s_lastUnixMs + 1;
+ 	}
+-	s_lastTaiMs = taiMs;
++	tai_reserve_if_needed(unixMs);
++	s_lastUnixMs = unixMs;
+ 
+-	uint64_t seconds = taiMs / 1000;
+-	uint32_t nanos = (uint32_t)((taiMs % 1000) * 1000000ULL);
++	uint64_t seconds = TAI64_SECONDS_BASE + unixMs / 1000;
++	uint32_t nanos = (uint32_t)((unixMs % 1000) * 1000000ULL);
+ 	U64TO8_BIG(output + 0, seconds);
+ 	U32TO8_BIG(output + 8, nanos);
+-
+-	// Пишем только растущие значения (раз в ~2 мин, при rekey-handshake)
+-	tai_persist_if_greater(taiMs);
+ }
+ 
+ bool wireguard_is_under_load() {
+ 
