@@ -16,6 +16,9 @@
 #include <StreamingJsonParser.h>
 #include <Util.h>
 #include <WolfsslCrypto.h>
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+#include <WireGuardManager.h>
+#endif
 
 #include <iterator>
 
@@ -102,6 +105,9 @@ void OpdsBookBrowserActivity::onEnter() {
 }
 
 void OpdsBookBrowserActivity::onExit() {
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  WIREGUARD_TUNNEL.shutdown();
+#endif
   releaseEntries();
   navigationHistory.clear();
   if (!detailCoverPath.empty()) {
@@ -305,6 +311,15 @@ void OpdsBookBrowserActivity::startBrowse() {
   }
   nav.reset();
   beginLoading();
+#if defined(CROSSPOINT_ENABLE_WIREGUARD)
+  if (SETTINGS.wireGuardEnabled != 0) {
+    requestUpdateAndWait();
+    if (!WIREGUARD_TUNNEL.prepare(true)) {
+      fail(StrId::STR_WIREGUARD_FAILED);
+      return;
+    }
+  }
+#endif
   fetchFeed(currentPath);
 }
 
@@ -920,7 +935,7 @@ void OpdsBookBrowserActivity::loadDetailCover(const std::string& docUrl, const s
   std::string tmp = "/.crosspoint/opds_cover";
   tmp += isPng ? ".png" : ".jpg";
 
-  if (ESP.getFreeHeap() < HttpDownloader::MIN_TLS_FREE_HEAP) {
+  if (!HttpDownloader::hasDownloadHeapHeadroom(url, ESP.getFreeHeap(), ESP.getMaxAllocHeap())) {
     LOG_INF("OPDS", "Skipping cover: low heap");
     return;
   }
