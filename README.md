@@ -1,3 +1,11 @@
+> [!IMPORTANT]
+> **This is my X4 Pro WireGuard fork of CrossPoint Reader.**
+>
+> It adds WireGuard support specifically for the Xteink X4 Pro. This cannot be upstreamed because CrossPoint's network
+> code is currently frozen. To use it, put your WireGuard config at `/.crosspoint/wireguard.conf` on the SD card, then
+> enable **WireGuard** under **Settings → Connectivity**. When enabled, OPDS and KOReader progress sync use the tunnel;
+> when disabled, networking works as normal. I have tested both OPDS and KOReader sync on my system, and they work.
+
 # CrossPoint Reader
 
 [![Fund contributors](https://img.shields.io/badge/%F0%9F%91%91_Fund_contributors-royalty.dev-BB953A?style=for-the-badge&labelColor=1a1a1a)](https://app.royalty.dev/crosspoint-reader/crosspoint-reader)
